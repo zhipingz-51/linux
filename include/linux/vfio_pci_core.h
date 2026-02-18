@@ -28,7 +28,6 @@
 struct vfio_pci_core_device;
 struct vfio_pci_region;
 struct p2pdma_provider;
-struct dma_buf_attachment;
 
 struct vfio_pci_eventfd {
 	struct eventfd_ctx	*ctx;
@@ -256,8 +255,5 @@ vfio_pci_core_get_iomap(struct vfio_pci_core_device *vdev, unsigned int bar)
 
 	return vdev->barmap[bar];
 }
-
-int vfio_pci_dma_buf_iommufd_map(struct dma_buf_attachment *attachment,
-				 struct phys_vec *phys);
 
 #endif /* VFIO_PCI_CORE_H */
