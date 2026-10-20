@@ -69,11 +69,17 @@ static unsigned int calc_sg_nents(struct dma_iova_state *state,
  * @sgt:    Scatter-gather table
  * @state:  DMA IOVA state relevant in IOMMU-based DMA
  * @size:   Total size of DMA transfer
+ * @mapped_addrs: Original DMA addresses for individual physical ranges
+ * @ranges: Physical ranges retained for exact DMA unmapping
+ * @nr_mapped: Number of successfully mapped physical ranges
  */
 struct dma_buf_dma {
 	struct sg_table sgt;
 	struct dma_iova_state *state;
 	size_t size;
+	dma_addr_t *mapped_addrs;
+	struct phys_vec *ranges;
+	size_t nr_mapped;
 };
 
 /**
@@ -116,7 +122,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 
 	dma_resv_assert_held(attach->dmabuf->resv);
 
-	if (WARN_ON(!attach || !attach->dmabuf || !provider))
+	if (WARN_ON(!dma_dev || !provider))
 		/* This function is supposed to work on MMIO memory only */
 		return ERR_PTR(-EINVAL);
 
@@ -144,6 +150,17 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 		goto err_free_dma;
 	}
 
+	if (dma->state && !dma_use_iova(dma->state)) {
+		dma->mapped_addrs = kcalloc(nr_ranges, sizeof(*dma->mapped_addrs),
+					   GFP_KERNEL);
+		dma->ranges = kmemdup_array(phys_vec, nr_ranges, sizeof(*phys_vec),
+					   GFP_KERNEL);
+		if (!dma->mapped_addrs || !dma->ranges) {
+			ret = -ENOMEM;
+			goto err_free_state;
+		}
+	}
+
 	nents = calc_sg_nents(dma->state, phys_vec, nr_ranges, size);
 
 	/* sg_alloc_table will cleanly fail and return -EINVAL if nents == 0 */
@@ -159,7 +176,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 						       phys_vec[i].paddr);
 		} else if (dma_use_iova(dma->state)) {
 			ret = dma_iova_link(dma_dev, dma->state,
-					    phys_vec[i].paddr, 0,
+					    phys_vec[i].paddr, mapped_len,
 					    phys_vec[i].len, dir,
 					    DMA_ATTR_MMIO);
 			if (ret)
@@ -170,9 +187,12 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 			addr = dma_map_phys(dma_dev, phys_vec[i].paddr,
 					    phys_vec[i].len, dir,
 					    DMA_ATTR_MMIO);
-			ret = dma_mapping_error(dma_dev, addr);
-			if (ret)
+			if (dma_mapping_error(dma_dev, addr)) {
+				ret = -EIO;
 				goto err_unmap_dma;
+			}
+			dma->mapped_addrs[i] = addr;
+			dma->nr_mapped++;
 		}
 
 		if (!dma->state || !dma_use_iova(dma->state))
@@ -205,18 +225,21 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 	return &dma->sgt;
 
 err_unmap_dma:
-	if (!i || !dma->state) {
-		; /* Do nothing */
-	} else if (dma_use_iova(dma->state)) {
-		dma_iova_destroy(dma_dev, dma->state, mapped_len, dir,
-				 DMA_ATTR_MMIO);
-	} else {
-		for_each_sgtable_dma_sg(&dma->sgt, sgl, i)
-			dma_unmap_phys(dma_dev, sg_dma_address(sgl),
-				       sg_dma_len(sgl), dir, DMA_ATTR_MMIO);
+	if (dma->state && !dma_use_iova(dma->state)) {
+		while (dma->nr_mapped) {
+			size_t n = --dma->nr_mapped;
+
+			dma_unmap_phys(dma_dev, dma->mapped_addrs[n],
+				       dma->ranges[n].len, dir, DMA_ATTR_MMIO);
+		}
 	}
 	sg_free_table(&dma->sgt);
 err_free_state:
+	kfree(dma->ranges);
+	kfree(dma->mapped_addrs);
+	if (dma->state && dma_use_iova(dma->state))
+		dma_iova_destroy(dma_dev, dma->state, mapped_len, dir,
+				 DMA_ATTR_MMIO);
 	kfree(dma->state);
 err_free_dma:
 	kfree(dma);
@@ -248,13 +271,13 @@ void dma_buf_free_sgt(struct dma_buf_attachment *attach, struct sg_table *sgt,
 		dma_iova_destroy(dma_dev, dma->state, dma->size, dir,
 				 DMA_ATTR_MMIO);
 	} else {
-		struct scatterlist *sgl;
-
-		for_each_sgtable_dma_sg(sgt, sgl, i)
-			dma_unmap_phys(dma_dev, sg_dma_address(sgl),
-				       sg_dma_len(sgl), dir, DMA_ATTR_MMIO);
+		for (i = 0; i < dma->nr_mapped; i++)
+			dma_unmap_phys(dma_dev, dma->mapped_addrs[i],
+				       dma->ranges[i].len, dir, DMA_ATTR_MMIO);
 	}
 
+	kfree(dma->ranges);
+	kfree(dma->mapped_addrs);
 	sg_free_table(sgt);
 	kfree(dma->state);
 	kfree(dma);
