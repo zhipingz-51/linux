@@ -3,6 +3,7 @@
  */
 #include <linux/dma-buf-mapping.h>
 #include <linux/pci-p2pdma.h>
+#include <linux/pci-tph.h>
 #include <linux/dma-resv.h>
 
 #include "vfio_pci_priv.h"
@@ -20,8 +21,17 @@ struct vfio_pci_dma_buf {
 	u32 nr_ranges;
 	struct kref kref;
 	struct completion comp;
-	/* Updated under dmabuf->resv and memory_lock. */
+
+	/*
+	 * Updates protected by dmabuf->resv, @revoked additionally
+	 * protected by memory_lock.
+	 */
+	u16 tph_st_ext;
+	u8 tph_st;
 	bool revoked;
+	u8 tph_st_valid:1;
+	u8 tph_st_ext_valid:1;
+	u8 tph_ph:2;
 };
 
 static int vfio_pci_dma_buf_attach(struct dma_buf *dmabuf,
@@ -66,6 +76,33 @@ vfio_pci_dma_buf_map(struct dma_buf_attachment *attachment,
 
 	kref_get(&priv->kref);
 	return ret;
+}
+
+static int vfio_pci_dma_buf_get_pci_tph(struct dma_buf_attachment *attach,
+					struct sg_table *sgt, bool extended,
+					u16 *steering_tag, u8 *ph)
+{
+	struct vfio_pci_dma_buf *priv = attach->dmabuf->priv;
+
+	dma_resv_assert_held(attach->dmabuf->resv);
+	if (priv->revoked)
+		return -ENODEV;
+
+	/* Use the route already selected for this exact mapping. */
+	if (!dma_buf_phys_vec_is_direct(attach, sgt))
+		return -EOPNOTSUPP;
+
+	if (extended) {
+		if (!priv->tph_st_ext_valid)
+			return -EOPNOTSUPP;
+		*steering_tag = priv->tph_st_ext;
+	} else {
+		if (!priv->tph_st_valid)
+			return -EOPNOTSUPP;
+		*steering_tag = priv->tph_st;
+	}
+	*ph = priv->tph_ph;
+	return 0;
 }
 
 static void vfio_pci_dma_buf_unmap(struct dma_buf_attachment *attachment,
@@ -154,6 +191,7 @@ static int vfio_pci_dma_buf_match_mapping(struct dma_buf_match_args *args)
 }
 
 static const struct dma_buf_ops vfio_pci_dmabuf_ops = {
+	.get_pci_tph = vfio_pci_dma_buf_get_pci_tph,
 	.attach = vfio_pci_dma_buf_attach,
 	.release = vfio_pci_dma_buf_release,
 	.match_mapping = vfio_pci_dma_buf_match_mapping,
@@ -350,6 +388,94 @@ err_free_priv:
 	kfree(priv);
 err_free_ranges:
 	kfree(dma_ranges);
+	return ret;
+}
+
+int vfio_pci_core_feature_dma_buf_tph(struct vfio_pci_core_device *vdev,
+				      u32 flags,
+				      struct vfio_device_feature_dma_buf_tph __user *arg,
+				      size_t argsz)
+{
+	struct vfio_device_feature_dma_buf_tph set_tph;
+	struct vfio_pci_dma_buf *priv;
+	struct dma_buf *dmabuf;
+	u8 comp;
+	int ret;
+
+	if (!vdev->pci_ops || !vdev->pci_ops->get_dmabuf_phys)
+		return -EOPNOTSUPP;
+
+	comp = pcie_tph_completer_type(vdev->pdev);
+	if (comp == PCI_EXP_DEVCAP2_TPH_COMP_NONE)
+		return -EOPNOTSUPP;
+
+	ret = vfio_check_feature(flags, argsz, VFIO_DEVICE_FEATURE_SET,
+				 sizeof(set_tph));
+	if (ret != 1)
+		return ret;
+
+	if (copy_from_user(&set_tph, arg, sizeof(set_tph)))
+		return -EFAULT;
+
+	if (set_tph.flags & ~(VFIO_DMA_BUF_TPH_ST | VFIO_DMA_BUF_TPH_ST_EXT))
+		return -EINVAL;
+
+	if (set_tph.ph & ~0x3)
+		return -EINVAL;
+
+	if ((set_tph.flags & VFIO_DMA_BUF_TPH_ST_EXT) &&
+	    comp != PCI_EXP_DEVCAP2_TPH_COMP_EXT_TPH)
+		return -EOPNOTSUPP;
+
+	dmabuf = dma_buf_get(set_tph.dmabuf_fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
+
+	if (dmabuf->ops != &vfio_pci_dmabuf_ops) {
+		ret = -EINVAL;
+		goto out_put;
+	}
+
+	priv = dmabuf->priv;
+
+	/*
+	 * @revoked and the dma-buf/vdev association are torn down under
+	 * memory_lock by vfio_pci_dma_buf_cleanup(); hold it while validating
+	 * ownership and publishing so the dma-buf cannot be disassociated from
+	 * @vdev underneath us. Lock order memory_lock -> dmabuf->resv matches
+	 * vfio_pci_dma_buf_move().
+	 */
+	down_read(&vdev->memory_lock);
+	if (priv->vdev != vdev) {
+		ret = -EINVAL;
+		goto out_unlock_mem;
+	}
+
+	ret = dma_resv_lock_interruptible(dmabuf->resv, NULL);
+	if (ret)
+		goto out_unlock_mem;
+
+	/* Mapping snapshots and programmed mkeys must not retain old hints. */
+	if (priv->tph_st != set_tph.steering_tag ||
+	    priv->tph_st_ext != set_tph.steering_tag_ext ||
+	    priv->tph_ph != set_tph.ph ||
+	    priv->tph_st_valid != !!(set_tph.flags & VFIO_DMA_BUF_TPH_ST) ||
+	    priv->tph_st_ext_valid != !!(set_tph.flags & VFIO_DMA_BUF_TPH_ST_EXT))
+		dma_buf_invalidate_mappings(dmabuf);
+
+	priv->tph_st         = set_tph.steering_tag;
+	priv->tph_st_ext     = set_tph.steering_tag_ext;
+	priv->tph_ph         = set_tph.ph;
+	priv->tph_st_valid   = !!(set_tph.flags & VFIO_DMA_BUF_TPH_ST);
+	priv->tph_st_ext_valid =
+		!!(set_tph.flags & VFIO_DMA_BUF_TPH_ST_EXT);
+	dma_resv_unlock(dmabuf->resv);
+	ret = 0;
+
+out_unlock_mem:
+	up_read(&vdev->memory_lock);
+out_put:
+	dma_buf_put(dmabuf);
 	return ret;
 }
 
