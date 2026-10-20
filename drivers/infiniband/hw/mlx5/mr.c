@@ -39,6 +39,7 @@
 #include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-resv.h>
+#include <linux/pci-tph.h>
 #include <rdma/frmr_pools.h>
 #include <rdma/ib_umem_odp.h>
 #include "dm.h"
@@ -198,6 +199,24 @@ static void mlx5_ib_put_st_handle_ref(struct mlx5_ib_dev *dev,
 				 kernel_vendor_key);
 
 	mlx5_ib_put_st_index_ref(dev, st_index);
+}
+
+int mlx5_ib_validate_dmabuf_mapping(struct mlx5_ib_mr *mr,
+			      struct ib_umem_dmabuf *umem_dmabuf)
+{
+	struct mlx5_ib_dmabuf_tph *tph = &mr->dmabuf_tph;
+	u16 steering_tag;
+	u8 ph;
+	int ret;
+
+	dma_resv_assert_held(umem_dmabuf->attach->dmabuf->resv);
+	if (!tph->valid)
+		return 0;
+	ret = dma_buf_get_pci_tph(umem_dmabuf->attach, umem_dmabuf->sgt,
+				 tph->extended, &steering_tag, &ph);
+	if (ret || steering_tag != tph->steering_tag || ph != tph->ph)
+		return -EFAULT;
+	return 0;
 }
 
 static struct mlx5_ib_mr *
@@ -934,11 +953,12 @@ static void mlx5_ib_dmabuf_invalidate_cb(struct dma_buf_attachment *attach)
 
 	dma_resv_assert_held(umem_dmabuf->attach->dmabuf->resv);
 
-	if (!umem_dmabuf->sgt || !mr)
+	if (!umem_dmabuf->sgt)
 		return;
 
 	/* MLX5_IB_UPD_XLT_ZAP does not change the pdn */
-	mlx5r_umr_update_mr_pas(mr, MLX5_IB_UPD_XLT_ZAP, 0);
+	if (mr)
+		mlx5r_umr_update_mr_pas(mr, MLX5_IB_UPD_XLT_ZAP, 0);
 	ib_umem_dmabuf_unmap_pages(umem_dmabuf);
 }
 
@@ -946,6 +966,64 @@ static const struct dma_buf_attach_ops mlx5_ib_dmabuf_attach_ops = {
 	.allow_peer2peer = true,
 	.invalidate_mappings = mlx5_ib_dmabuf_invalidate_cb,
 };
+
+static int prepare_dmabuf_mapping(struct mlx5_ib_dev *dev,
+				  struct ib_umem_dmabuf *umem_dmabuf,
+				  struct mlx5_ib_dmabuf_tph *tph,
+				  u16 *st_index, u8 *ph,
+				  bool use_exporter_tph)
+{
+	struct dma_buf *dmabuf = umem_dmabuf->attach->dmabuf;
+	bool extended = false, tph_enabled = false;
+	u16 steering_tag, local_st_index;
+	u8 hint;
+	int ret;
+
+	switch (pcie_tph_enabled_req_type(dev->mdev->pdev)) {
+	case PCI_TPH_REQ_TPH_ONLY:
+		tph_enabled = true;
+		break;
+	case PCI_TPH_REQ_EXT_TPH:
+		extended = true;
+		tph_enabled = true;
+		break;
+	}
+
+	/* Mapping and hint lookup need no MR. Allocation can reclaim memory
+	 * and invalidate this early mapping, so release resv before allocating.
+	 */
+	dma_resv_lock(dmabuf->resv, NULL);
+	ret = ib_umem_dmabuf_map_pages(umem_dmabuf);
+	if (ret)
+		goto unlock;
+	if (!use_exporter_tph || !tph_enabled)
+		goto unlock;
+	ret = dma_buf_get_pci_tph(umem_dmabuf->attach, umem_dmabuf->sgt,
+				 extended, &steering_tag, &hint);
+	dma_resv_unlock(dmabuf->resv);
+	if (ret == -EOPNOTSUPP)
+		return 0;
+	if (ret)
+		return ret;
+
+	ret = mlx5_st_alloc_index_by_tag(dev->mdev, steering_tag,
+					 &local_st_index);
+	if (ret) {
+		mlx5_ib_dbg(dev, "st_alloc_index_by_tag failed (%d)\n", ret);
+		return ret == -EOPNOTSUPP ? 0 : ret;
+	}
+	*st_index = local_st_index;
+	*ph = hint;
+	tph->steering_tag = steering_tag;
+	tph->ph = hint;
+	tph->extended = extended;
+	tph->valid = true;
+	return 0;
+
+unlock:
+	dma_resv_unlock(dmabuf->resv);
+	return ret;
+}
 
 static void mlx5_ib_mr_put_st_handle_ref(struct mlx5_ib_mr *mr)
 {
@@ -966,6 +1044,7 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
 	struct mlx5_ib_mr *mr = NULL;
 	struct ib_umem_dmabuf *umem_dmabuf;
+	struct mlx5_ib_dmabuf_tph tph = {};
 	u16 st_index = MLX5_MKC_PCIE_TPH_NO_STEERING_TAG_INDEX;
 	u8 ph = MLX5_IB_NO_PH;
 	int err;
@@ -990,6 +1069,13 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 	if (IS_ERR(umem_dmabuf)) {
 		mlx5_ib_dbg(dev, "umem_dmabuf get failed (%pe)\n", umem_dmabuf);
 		return ERR_CAST(umem_dmabuf);
+	}
+
+	err = prepare_dmabuf_mapping(dev, umem_dmabuf, &tph, &st_index, &ph,
+				     !dmah);
+	if (err) {
+		ib_umem_release(&umem_dmabuf->umem);
+		return ERR_PTR(err);
 	}
 
 	if (dmah) {
@@ -1017,9 +1103,9 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 
 	mlx5_ib_dbg(dev, "mkey 0x%x\n", mr->mmkey.key);
 
+	mr->dmabuf_tph = tph;
 	mr->st_ref_held = st_index != MLX5_MKC_PCIE_TPH_NO_STEERING_TAG_INDEX;
 	atomic_add(ib_umem_num_pages(mr->umem), &dev->mdev->priv.reg_pages);
-	umem_dmabuf->private = mr;
 	if (!pinned_mode) {
 		err = mlx5r_odp_create_eq(dev, &dev->odp_pf_eq);
 		if (err)
@@ -1031,6 +1117,9 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 	} else {
 		mr->data_direct = true;
 	}
+	dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
+	umem_dmabuf->private = mr;
+	dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
 
 	err = mlx5_ib_init_dmabuf_mr(mr, pd);
 	if (err)

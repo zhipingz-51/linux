@@ -8,6 +8,7 @@
 #define MLX5_IB_H
 
 #include <linux/kernel.h>
+#include <linux/dma-buf.h>
 #include <linux/sched.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_umem.h>
@@ -646,6 +647,15 @@ enum mlx5_mkey_type {
 /* Used for non-existent ph value */
 #define MLX5_IB_NO_PH 0xff
 
+struct dma_buf;
+
+struct mlx5_ib_dmabuf_tph {
+	u16 steering_tag;
+	u8 ph;
+	bool extended;
+	bool valid;
+};
+
 struct mlx5_ib_mkey {
 	u32 key;
 	enum mlx5_mkey_type type;
@@ -728,6 +738,7 @@ struct mlx5_ib_mr {
 			u8 revoked :1;
 			/* Indicates previous dmabuf page fault occurred */
 			u8 dmabuf_faulted:1;
+			struct mlx5_ib_dmabuf_tph dmabuf_tph;
 			struct mlx5_ib_mkey null_mmkey;
 		};
 	};
@@ -1343,6 +1354,8 @@ struct ib_mr *mlx5_ib_rereg_user_mr(struct ib_mr *ib_mr, int flags, u64 start,
 				    u64 length, u64 virt_addr, int access_flags,
 				    struct ib_pd *pd, struct ib_udata *udata);
 int mlx5_ib_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata);
+int mlx5_ib_validate_dmabuf_mapping(struct mlx5_ib_mr *mr,
+			      struct ib_umem_dmabuf *umem_dmabuf);
 struct ib_mr *mlx5_ib_alloc_mr(struct ib_pd *pd, enum ib_mr_type mr_type,
 			       u32 max_num_sg);
 struct ib_mr *mlx5_ib_alloc_mr_integrity(struct ib_pd *pd,
@@ -1648,37 +1661,16 @@ static inline bool rt_supported(int ts_cap)
 	       ts_cap == MLX5_TIMESTAMP_FORMAT_CAP_FREE_RUNNING_AND_REAL_TIME;
 }
 
-/*
- * PCI Peer to Peer is a trainwreck. If no switch is present then things
- * sometimes work, depending on the pci_distance_p2p logic for excluding broken
- * root complexes. However if a switch is present in the path, then things get
- * really ugly depending on how the switch is setup. This table assumes that the
- * root complex is strict and is validating that all req/reps are matches
- * perfectly - so any scenario where it sees only half the transaction is a
- * failure.
- *
- * CR/RR/DT  ATS RO P2P
- * 00X       X   X  OK
- * 010       X   X  fails (request is routed to root but root never sees comp)
- * 011       0   X  fails (request is routed to root but root never sees comp)
- * 011       1   X  OK
- * 10X       X   1  OK
- * 101       X   0  fails (completion is routed to root but root didn't see req)
- * 110       X   0  SLOW
- * 111       0   0  SLOW
- * 111       1   0  fails (completion is routed to root but root didn't see req)
- * 111       1   1  OK
- *
- * Unfortunately we cannot reliably know if a switch is present or what the
- * CR/RR/DT ACS settings are, as in a VM that is all hidden. Assume that
- * CR/RR/DT is 111 if the ATS cap is enabled and follow the last three rows.
- *
- * For now assume if the umem is a dma_buf then it is P2P.
+/* The attachment-scoped TPH contract describes untranslated Requests.
+ * Keep ATS disabled for those exporters, including their untagged fallback.
+ * Other exporters retain the existing ATS assumption.
  */
 static inline bool mlx5_umem_needs_ats(struct mlx5_ib_dev *dev,
 				       struct ib_umem *umem, int access_flags)
 {
 	if (!MLX5_CAP_GEN(dev->mdev, ats) || !umem->is_dmabuf)
+		return false;
+	if (to_ib_umem_dmabuf(umem)->attach->dmabuf->ops->get_pci_tph)
 		return false;
 	return access_flags & IB_ACCESS_RELAXED_ORDERING;
 }
