@@ -145,6 +145,26 @@ struct dma_buf_ops {
 	 */
 	void (*unpin)(struct dma_buf_attachment *attach);
 
+	/**
+	 * @get_pci_tph: Optional ST/PH query for a live SGT mapping.
+	 * @attach: Attachment that owns the mapping
+	 * @sgt: Exporter SGT, with any DMA-BUF debug wrapper removed by core
+	 * @extended: Select the 16-bit rather than 8-bit steering-tag namespace
+	 * @steering_tag: Returned raw steering tag
+	 * @ph: Returned two-bit processing hint
+	 *
+	 * Called under dma_resv after mapping and before unmap. Return 0 only
+	 * when ST/PH applies to this backing and its direct peer mapping for
+	 * untranslated Requests and strict Completions. Return -EOPNOTSUPP
+	 * when no eligible hint exists; ordinary DMA may still be usable.
+	 *
+	 * Importers must use untranslated Requests and re-query after remap.
+	 * A snapshot expires on unmap/invalidation; do not query another
+	 * attachment's SGT or expose exporter physical addresses/providers.
+	 */
+	int (*get_pci_tph)(struct dma_buf_attachment *attach, struct sg_table *sgt,
+			   bool extended, u16 *steering_tag, u8 *ph);
+
 	/* TODO: Add try_map_dma_buf version, to return immed with -EBUSY
 	 * if the call would block.
 	 */
@@ -547,6 +567,8 @@ void dma_buf_detach(struct dma_buf *dmabuf,
 		    struct dma_buf_attachment *attach);
 int dma_buf_pin(struct dma_buf_attachment *attach);
 void dma_buf_unpin(struct dma_buf_attachment *attach);
+int dma_buf_get_pci_tph(struct dma_buf_attachment *attach, struct sg_table *sgt,
+			bool extended, u16 *steering_tag, u8 *ph);
 
 struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info);
 

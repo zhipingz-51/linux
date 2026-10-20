@@ -69,6 +69,8 @@ static unsigned int calc_sg_nents(struct dma_iova_state *state,
  * @sgt:    Scatter-gather table
  * @state:  DMA IOVA state relevant in IOMMU-based DMA
  * @size:   Total size of DMA transfer
+ * @attach: Attachment that owns the mapping
+ * @direct: Mapping uses peer bus addresses for untranslated Requests
  * @mapped_addrs: Original DMA addresses for individual physical ranges
  * @ranges: Physical ranges retained for exact DMA unmapping
  * @nr_mapped: Number of successfully mapped physical ranges
@@ -77,6 +79,8 @@ struct dma_buf_dma {
 	struct sg_table sgt;
 	struct dma_iova_state *state;
 	size_t size;
+	struct dma_buf_attachment *attach;
+	bool direct;
 	dma_addr_t *mapped_addrs;
 	struct phys_vec *ranges;
 	size_t nr_mapped;
@@ -101,9 +105,9 @@ struct dma_buf_dma {
  *
  * A mapping must be unmapped by using dma_buf_free_sgt().
  *
- * NOTE: This function is intended for exporters. If direct traffic routing is
- * mandatory exporter should call routing pci_p2pdma_map_type() before calling
- * this function.
+ * Exporters may inspect the retained mapping result with
+ * dma_buf_phys_vec_is_direct(). The result follows this SGT lifetime and
+ * assumes untranslated Requests, strict Completions and stable ACS controls.
  */
 struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 					 struct p2pdma_provider *provider,
@@ -119,6 +123,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 	dma_addr_t addr;
 	size_t i;
 	int ret;
+	enum pci_p2pdma_map_type route;
 
 	dma_resv_assert_held(attach->dmabuf->resv);
 
@@ -130,7 +135,10 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 	if (!dma)
 		return ERR_PTR(-ENOMEM);
 
-	switch (pci_p2pdma_map_type(provider, dma_dev)) {
+	route = pci_p2pdma_map_type(provider, dma_dev);
+	dma->attach = attach;
+	dma->direct = route == PCI_P2PDMA_MAP_BUS_ADDR;
+	switch (route) {
 	case PCI_P2PDMA_MAP_BUS_ADDR:
 		/*
 		 * There is no need in IOVA at all for this flow.
@@ -246,6 +254,29 @@ err_free_dma:
 	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_phys_vec_to_sgt, "DMA_BUF");
+
+/**
+ * dma_buf_phys_vec_is_direct - Query an exporter's existing MMIO mapping
+ * @attach: Attachment that produced @sgt
+ * @sgt: Exporter SGT returned by dma_buf_phys_vec_to_sgt(), before debug wrapping
+ *
+ * Call under dma_resv before unmapping. This reports the address selection
+ * already used by the mapping, without exposing its provider or physical list.
+ * It assumes untranslated Requests and strict Completions. It does not refresh
+ * the PCI routing cache or support ACS changes while a mapping is active.
+ */
+bool dma_buf_phys_vec_is_direct(struct dma_buf_attachment *attach,
+			       struct sg_table *sgt)
+{
+	struct dma_buf_dma *dma;
+
+	if (IS_ERR_OR_NULL(sgt))
+		return false;
+	dma_resv_assert_held(attach->dmabuf->resv);
+	dma = container_of(sgt, struct dma_buf_dma, sgt);
+	return dma->attach == attach && dma->direct;
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_phys_vec_is_direct, "DMA_BUF");
 
 /**
  * dma_buf_free_sgt- unmaps the buffer

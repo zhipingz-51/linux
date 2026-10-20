@@ -1215,6 +1215,46 @@ void dma_buf_unpin(struct dma_buf_attachment *attach)
 EXPORT_SYMBOL_NS_GPL(dma_buf_unpin, "DMA_BUF");
 
 /**
+ * dma_buf_get_pci_tph - Query eligible hints for a live attachment mapping
+ * @attach: Attachment that produced @sgt
+ * @sgt: Live SGT returned by dma_buf_sgt_map_attachment()
+ * @extended: Select the 16-bit rather than 8-bit steering-tag namespace
+ * @steering_tag: Returned raw steering tag
+ * @ph: Returned two-bit processing hint
+ *
+ * Call with dma_resv held, after mapping and before unmap. The exporter must
+ * bind hints to this mapping and gate them on direct untranslated peer access
+ * with strict Completions. -EOPNOTSUPP means no eligible hint; it does not make
+ * an otherwise usable DMA mapping fail. Other errors are propagated.
+ *
+ * Importers must use untranslated Requests. Revalidate a saved tuple against
+ * a new map after invalidation and before enabling hardware that retains it.
+ */
+int dma_buf_get_pci_tph(struct dma_buf_attachment *attach, struct sg_table *sgt,
+			bool extended, u16 *steering_tag, u8 *ph)
+{
+	struct dma_buf *dmabuf;
+	int ret;
+
+	if (!attach || !attach->dmabuf || IS_ERR_OR_NULL(sgt) ||
+	    !steering_tag || !ph)
+		return -EINVAL;
+	dmabuf = attach->dmabuf;
+	dma_resv_assert_held(dmabuf->resv);
+	if (attach->map_type.type != &dma_buf_mapping_sgt_type ||
+	    !dmabuf->ops->get_pci_tph)
+		return -EOPNOTSUPP;
+	if (IS_ENABLED(CONFIG_DMABUF_DEBUG))
+		sgt = container_of(sgt, struct dma_buf_sg_table_wrapper,
+				   wrapper)->original;
+	ret = dmabuf->ops->get_pci_tph(attach, sgt, extended, steering_tag, ph);
+	if (!ret && (*ph > 3 || (!extended && *steering_tag > U8_MAX)))
+		return -EINVAL;
+	return ret;
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_get_pci_tph, "DMA_BUF");
+
+/**
  * dma_buf_sgt_map_attachment - Returns the scatterlist table of the attachment;
  * mapped into _device_ address space. Is a wrapper for map_dma_buf() of the
  * dma_buf_ops.
