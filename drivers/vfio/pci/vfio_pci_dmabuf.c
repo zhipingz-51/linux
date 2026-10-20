@@ -20,7 +20,8 @@ struct vfio_pci_dma_buf {
 	u32 nr_ranges;
 	struct kref kref;
 	struct completion comp;
-	u8 revoked : 1;
+	/* Updated under dmabuf->resv and memory_lock. */
+	bool revoked;
 };
 
 static int vfio_pci_dma_buf_attach(struct dma_buf *dmabuf,
@@ -28,7 +29,7 @@ static int vfio_pci_dma_buf_attach(struct dma_buf *dmabuf,
 {
 	struct vfio_pci_dma_buf *priv = dmabuf->priv;
 
-	if (priv->revoked)
+	if (READ_ONCE(priv->revoked))
 		return -ENODEV;
 
 	if (!dma_buf_attach_revocable(attachment))
@@ -109,6 +110,10 @@ vfio_pci_dma_pal_map_phys(struct dma_buf_attachment *attach)
 	struct vfio_pci_dma_buf *priv = attach->dmabuf->priv;
 	struct dma_buf_phys_list *phys;
 
+	dma_resv_assert_held(attach->dmabuf->resv);
+	if (priv->revoked)
+		return ERR_PTR(-ENODEV);
+
 	phys = kvmalloc(struct_size(phys, phys, priv->nr_ranges), GFP_KERNEL);
 	if (!phys)
 		return ERR_PTR(-ENOMEM);
@@ -117,14 +122,18 @@ vfio_pci_dma_pal_map_phys(struct dma_buf_attachment *attach)
 	memcpy(phys->phys, priv->phys_vec,
 	       sizeof(phys->phys[0]) * priv->nr_ranges);
 
+	kref_get(&priv->kref);
 	return phys;
 }
 
 static void vfio_pci_dma_pal_unmap_phys(struct dma_buf_attachment *attach,
 					struct dma_buf_phys_list *phys)
 {
-	/* FIXME when rebased on Leon's series this manages the refcount */
+	struct vfio_pci_dma_buf *priv = attach->dmabuf->priv;
+
+	dma_resv_assert_held(attach->dmabuf->resv);
 	kvfree(phys);
+	kref_put(&priv->kref, vfio_pci_dma_buf_done);
 }
 
 static const struct dma_buf_mapping_pal_exp_ops vfio_pci_dma_buf_pal_ops = {
@@ -358,7 +367,7 @@ void vfio_pci_dma_buf_move(struct vfio_pci_core_device *vdev, bool revoked)
 		if (priv->revoked != revoked) {
 			dma_resv_lock(priv->dmabuf->resv, NULL);
 			if (revoked)
-				priv->revoked = true;
+				WRITE_ONCE(priv->revoked, true);
 			dma_buf_invalidate_mappings(priv->dmabuf);
 			dma_resv_wait_timeout(priv->dmabuf->resv,
 					      DMA_RESV_USAGE_BOOKKEEP, false,
@@ -380,7 +389,7 @@ void vfio_pci_dma_buf_move(struct vfio_pci_core_device *vdev, bool revoked)
 				reinit_completion(&priv->comp);
 			} else {
 				dma_resv_lock(priv->dmabuf->resv, NULL);
-				priv->revoked = false;
+				WRITE_ONCE(priv->revoked, false);
 				dma_resv_unlock(priv->dmabuf->resv);
 			}
 		}
