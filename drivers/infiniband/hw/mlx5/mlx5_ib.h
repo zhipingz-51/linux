@@ -683,6 +683,8 @@ struct mlx5_ib_mr {
 	struct ib_umem *umem;
 	/* The mr is data direct related */
 	u8 data_direct :1;
+	/* This MR acquired a steering-table reference during registration. */
+	u8 st_ref_held :1;
 
 	union {
 		/* Used only by kernel MRs (umem == NULL) */
