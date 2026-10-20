@@ -40,6 +40,7 @@ of interest to most developers working on device drivers.
    device-io
    devfreq
    dma-buf
+   dma-buf-map-time-tph
    component
    io-mapping
    io_ordering
